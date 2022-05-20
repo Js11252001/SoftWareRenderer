@@ -1,187 +1,126 @@
 #include <vector>
-#include <cmath>
-#include "tgaimage.h"
-#include "model.h"
-#include "geometry.h"
+#include <limits>
 #include <iostream>
-#include <algorithm>
+#include "./core/geometry.h"
+#include "./core/model.h"
+#include "./core/tgaimage.h"
+#include "./platform/win32.h"
+#include "./core/our_gl.h"
 
-const TGAColor white = TGAColor(255, 255, 255, 255);
-const TGAColor red = TGAColor(255, 0, 0, 255);
-const TGAColor green = TGAColor(0, 255, 0, 255);
 Model* model = NULL;
+
 const int width = 800;
 const int height = 800;
-const int depth = 255;
-Vec3f camera(0, 0, 3.f);
-//4d-->3d
-//除以最后一个分量。（当最后一个分量为0，表示向量）
-//不为0，表示坐标
-Vec3f m2v(Matrix m) {
-    return Vec3f(m[0][0] / m[3][0], m[1][0] / m[3][0], m[2][0] / m[3][0]);
-}
 
-//3d-->4d
-//添加一个1表示坐标
-Matrix v2m(Vec3f v) {
-    Matrix m(4, 1);
-    m[0][0] = v.x;
-    m[1][0] = v.y;
-    m[2][0] = v.z;
-    m[3][0] = 1.f;
-    return m;
-}
+Vec3f light_dir(1, 1, 1);
+Vec3f       eye(1, 1, 3);
+Vec3f    center(0, 0, 0);
+Vec3f        up(0, 1, 0);
 
-//视角矩阵
-//将物体x，y坐标(-1,1)转换到屏幕坐标(100,700)    1/8width~7/8width
-//zbuffer(-1,1)转换到0~255
-Matrix viewport(int x, int y, int w, int h) {
-    Matrix m = Matrix::identity(4);
-    //第4列表示平移信息
-    m[0][3] = x + w / 2.f;
-    m[1][3] = y + h / 2.f;
-    m[2][3] = depth / 2.f;
-    //对角线表示缩放信息
-    m[0][0] = w / 2.f;
-    m[1][1] = h / 2.f;
-    m[2][2] = depth / 2.f;
-    return m;
-}
+struct Shader : public IShader {
+    mat<2, 3, float> varying_uv;  // triangle uv coordinates, written by the vertex shader, read by the fragment shader
+    mat<4, 3, float> varying_tri; // triangle coordinates (clip coordinates), written by VS, read by FS
+    mat<3, 3, float> varying_nrm; // normal per vertex to be interpolated by FS
+    mat<3, 3, float> ndc_tri;     // triangle in normalized device coordinates
 
-Vec3f barycentric(Vec3f* pts, Vec3f P) {
-    Vec3f r = Vec3f(pts[1].x - pts[0].x, pts[2].x - pts[0].x, pts[0].x - P.x)^Vec3f(pts[1].y - pts[0].y, pts[2].y - pts[0].y, pts[0].y - P.y);
-    if (r.z < 1) return Vec3f(-1, 1, 1);
-    return Vec3f(1.0f - (r.x + r.y) / r.z, r.x / r.z, r.y / r.z);
-}
-
-void line(int x0, int y0, int x1, int y1, TGAImage& image, TGAColor color) {
-    bool steep = false;
-    if (std::abs(x0 - x1) < std::abs(y0 - y1)) {
-        std::swap(x0, y0);
-        std::swap(x1, y1);
-        steep = true;
-    }
-    if (x0 > x1) {
-        std::swap(x0, x1);
-        std::swap(y0, y1);
+    virtual Vec4f vertex(int iface, int nthvert) {
+        varying_uv.set_col(nthvert, model->uv(iface, nthvert));
+        varying_nrm.set_col(nthvert, proj<3>((Projection * ModelView).invert_transpose() * embed<4>(model->normal(iface, nthvert), 0.f)));
+        Vec4f gl_Vertex = Projection * ModelView * embed<4>(model->vert(iface, nthvert));
+        varying_tri.set_col(nthvert, gl_Vertex);
+        ndc_tri.set_col(nthvert, proj<3>(gl_Vertex / gl_Vertex[3]));
+        return gl_Vertex;
     }
 
-    for (int x = x0; x <= x1; x++) {
-        float t = (x - x0) / (float)(x1 - x0);
-        int y = y0 * (1. - t) + y1 * t;
-        if (steep) {
-            image.set(y, x, color);
-        }
-        else {
-            image.set(x, y, color);
-        }
+    virtual bool fragment(Vec3f bar, TGAColor& color) {
+        Vec3f bn = (varying_nrm * bar).normalize();
+        Vec2f uv = varying_uv * bar;
+
+        mat<3, 3, float> A;
+        A[0] = ndc_tri.col(1) - ndc_tri.col(0);
+        A[1] = ndc_tri.col(2) - ndc_tri.col(0);
+        A[2] = bn;
+
+        mat<3, 3, float> AI = A.invert();
+
+        Vec3f i = AI * Vec3f(varying_uv[0][1] - varying_uv[0][0], varying_uv[0][2] - varying_uv[0][0], 0);
+        Vec3f j = AI * Vec3f(varying_uv[1][1] - varying_uv[1][0], varying_uv[1][2] - varying_uv[1][0], 0);
+
+        mat<3, 3, float> B;
+        B.set_col(0, i.normalize());
+        B.set_col(1, j.normalize());
+        B.set_col(2, bn);
+
+        Vec3f n = (B * model->normal(uv)).normalize();
+
+        float diff = (std::max)(0.f, n * light_dir);
+        color = model->diffuse(uv) * diff;
+
+        return false;
     }
-}
-
-void triangle(Vec3f* pts, float *zBuffer, TGAImage& image, TGAColor color) {
-    Vec2f min(std::numeric_limits<float>::max(), std::numeric_limits<float>::max());
-    Vec2f max(-std::numeric_limits<float>::max(), -std::numeric_limits<float>::max());
-    Vec2f clamp(image.get_width() - 1, image.get_height() - 1);
-
-    for (int i = 0; i < 3; i++) {
-        min.x = std::max(0.f, std::min(min.x, pts[i].x));
-        min.y = std::max(0.f, std::min(min.y, pts[i].y));
-        max.x = std::min(clamp.x,std::max(max.x, pts[i].x));
-        max.y = std::min(clamp.y,std::max(max.y, pts[i].y));
-    }
-    Vec3f P;
-    for (P.x = min.x; P.x <= max.x; P.x++) {
-        for (P.y = min.y; P.y <= max.y; P.y++) {
-            Vec3f p = barycentric(pts, P);
-            if (p.x < 0 || p.y < 0 || p.z < 0) continue;
-            P.z = 0;
-            for (int i = 0; i < 3; i++) P.z += pts[i].z * p[i];
-            if (zBuffer[int(P.y * width + P.x)] < P.z) {
-                image.set(P.x, P.y, color);
-                zBuffer[int(P.y * width + P.x)] = P.z;
-            }
-        }
-    }
-}
-
-void triangle(Vec3f* pts, Vec3f* tex, float* zBuffer, TGAImage& image, TGAImage& source, float intensity) {
-    Vec2f min(std::numeric_limits<float>::max(), std::numeric_limits<float>::max());
-    Vec2f max(-std::numeric_limits<float>::max(), -std::numeric_limits<float>::max());
-    Vec2f clamp(image.get_width() - 1, image.get_height() - 1);
-
-    for (int i = 0; i < 3; i++) {
-        min.x = std::max(0.f, std::min(min.x, pts[i].x));
-        min.y = std::max(0.f, std::min(min.y, pts[i].y));
-        max.x = std::min(clamp.x, std::max(max.x, pts[i].x));
-        max.y = std::min(clamp.y, std::max(max.y, pts[i].y));
-    }
-
-    Vec3f P;
-    for (P.x = min.x; P.x <= max.x; P.x++) {
-        for (P.y = min.y; P.y <= max.y; P.y++) {
-            Vec3f p = barycentric(pts, P);
-            Vec3f u;
-            if (p.x < 0 || p.y < 0 || p.z < 0) continue;
-            P.z = 0;
-            for (int i = 0; i < 3; i++) { 
-                P.z += pts[i].z * p[i];
-                u.x += p[i] * tex[i].x;
-                u.y += p[i] * tex[i].y;
-            }
-            if (zBuffer[int(P.y * width + P.x)] < P.z) {
-                TGAColor color = source.get(u.x * source.get_width(), u.y * source.get_height());
-                image.set(P.x, P.y, TGAColor(color.r * intensity, color.g * intensity, color.b * intensity, color.a * intensity));
-                zBuffer[int(P.y * width + P.x)] = P.z;
-            }
-        }
-    }
-}
-
+};
 
 int main(int argc, char** argv) {
 
-    if (2 == argc) {
-        model = new Model(argv[1]);
-    }
-    else {
-        model = new Model("obj/african_head.obj");
-    }
+    window_init(width + 100, height + 100, "SRender_window");
+    float* zbuffer = new float[width * height];
+    for (int i = width * height; i--; zbuffer[i] = -(std::numeric_limits<float>::max)());
 
-    //初始化投影矩阵
-    Matrix Projection = Matrix::identity(4);
-    //初始化视角矩阵
-    Matrix ViewPort = viewport(width / 8, height / 8, width * 3 / 4, height * 3 / 4);
-    //投影矩阵[3][2]=-1/c，c为相机z坐标
-    Projection[3][2] = -1.f / camera.z;
     TGAImage frame(width, height, TGAImage::RGB);
-    TGAImage a;
-    a.read_tga_file("african_head_diffuse.tga");
-    a.flip_vertically();
-    Vec3f light_dir(0, 0, -1); // define light_dir
-    float* zBuffer = new float[width * height];
-    for (int i = width * height; i--; zBuffer[i] = -std::numeric_limits<float>::max());
-
+    lookat(eye, center, up);
+    viewport(width / 8, height / 8, width * 3 / 4, height * 3 / 4);
+    projection(-1.f / (eye - center).norm());
+    light_dir = proj<3>((Projection * ModelView * embed<4>(light_dir, 0.f))).normalize();
+    int num_frames = 0;
+    float print_time = platform_get_time();
+    model = new Model("./obj/african_head/african_head.obj");
+    Shader shader;
     for (int i = 0; i < model->nfaces(); i++) {
-        auto face = model->face(i);
-        Vec3f screen_coords[3];
-        Vec3f world_coords[3];
-        Vec3f tex_coords[3];
         for (int j = 0; j < 3; j++) {
-            Vec3f v = model->vert(face.first[j]);
-            Vec3f u = model->tex(face.second[j]);
-            Vec3f ar = m2v(ViewPort * Projection * v2m(v));
-            screen_coords[j] = Vec3f(int(ar.x + .5), int(ar.y + .5), ar.z); //四舍五入防止截断
-            world_coords[j] = v;
-            tex_coords[j] = u;
+            shader.vertex(i, j);
         }
-        Vec3f n = (world_coords[2] - world_coords[0]) ^ (world_coords[1] - world_coords[0]);
-        n = n.normalize();
-        float intensity = n * light_dir;
-        if (intensity > 0) {
-            triangle(screen_coords, tex_coords, zBuffer, frame, a, intensity);
-        }
+        triangle(shader.varying_tri, shader, frame, zbuffer);
     }
-    frame.flip_vertically(); // to place the origin in the bottom left corner of the image 
-    frame.write_tga_file("output.tga");
+    delete model;
+    frame.flip_vertically();
+    while (!window->is_close)
+    {
+        float curr_time = platform_get_time();
+
+        // calculate and display FPS
+        //num_frames += 1;
+        //if (curr_time - print_time >= 1) {
+        //    int sum_millis = (int)((curr_time - print_time) * 1000);
+        //    int avg_millis = sum_millis / num_frames;
+        //    printf("fps: %3d, avg: %3d ms\n", num_frames, avg_millis);
+        //    num_frames = 0;
+        //    print_time = curr_time;
+        //}
+
+        //// reset mouse information
+        //window->mouse_info.wheel_delta = 0;
+        //window->mouse_info.orbit_delta = Vec2f(0, 0);
+        //window->mouse_info.fv_delta = Vec2f(0, 0);
+
+        // send framebuffer to window
+        // frame.flip_vertically();
+        window_draw(frame);
+        msg_dispatch();
+    }
+    //for (int m = 1; m < argc; m++) {
+    //    model = new Model(argv[m]);
+    //    Shader shader;
+    //    for (int i = 0; i < model->nfaces(); i++) {
+    //        for (int j = 0; j < 3; j++) {
+    //            shader.vertex(i, j);
+    //        }
+    //        triangle(shader.varying_tri, shader, frame, zbuffer);
+    //    }
+    //    delete model;
+    //}
+     // to place the origin in the bottom left corner of the image
+    frame.write_tga_file("framebuffer.tga");
+
+    delete[] zbuffer;
     return 0;
 }
